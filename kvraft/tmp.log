@@ -1,0 +1,5 @@
+Test: partitions, one client (3A) ...
+4 leader out
+0 leader out
+signal: interrupt
+FAIL	6.824/kvraft	33.423s

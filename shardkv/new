@@ -1,0 +1,638 @@
+package shardkv
+
+
+import "6.824/labrpc"
+import "6.824/raft"
+import "sync"
+import "6.824/labgob"
+import "time"
+import "bytes"
+import "sync/atomic"
+import "6.824/shardctrler"
+import "log"
+// import "fmt"
+import "github.com/sasha-s/go-deadlock"
+
+
+const Debug = true
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug {
+		log.Printf(format, a...)
+	}
+	return
+}
+
+type Op struct {
+	// Your definitions here.
+	// Field names must start with capital letters,
+	// otherwise RPC will break.
+	Key       string
+	Value     string
+	Op        string // "Put" or "Append"
+	ClientId  int
+	SequenceNumber int
+	Shard     int
+	ConfigNum int
+	Data	  map[string]string
+	Config    shardctrler.Config
+	SessionMap map[int]int
+
+}
+
+type ShardKV struct {
+	mu           deadlock.Mutex
+	me           int
+	rf           *raft.Raft
+	applyCh      chan raft.ApplyMsg
+	make_end     func(string) *labrpc.ClientEnd
+	gid          int
+	ctrlers      []*labrpc.ClientEnd
+	maxraftstate int // snapshot if log grows this big
+
+	// Your definitions here.
+	NotifyCh     map[int]chan bool
+	lastApplied  int
+	db           map[string]string
+	sessionMap   map[int]map[int]int
+	persister    *raft.Persister
+	dead         int32
+	config	     shardctrler.Config
+
+	mck		     *shardctrler.Clerk
+	configTimer        *time.Timer
+	configState  int
+	waitCond     *sync.Cond
+	addCh		 chan int
+	deleteCh     chan int
+	nextConfig   shardctrler.Config
+	lastLeaders  map[int]int
+
+}
+
+const (
+	latest = 0
+	updating = 1
+	waiting = 2
+	ready = 3
+)
+
+const timeout = 80*time.Millisecond
+const configtimeout = 30*time.Millisecond
+
+func (kv *ShardKV) waitRaft(op Op) bool {
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		return false
+	}
+	kv.mu.Lock()
+	DPrintf("gid: %v configNum: %v configState: %v waitRaft: %v ", kv.gid, kv.config.Num, kv.configState, op)
+	if kv.NotifyCh[index] == nil {
+		kv.NotifyCh[index] = make(chan bool, 1)
+	}
+	ch := kv.NotifyCh[index]
+	kv.mu.Unlock()
+	select {
+	case <-time.After(timeout):
+		kv.mu.Lock()
+		delete(kv.NotifyCh, op.ClientId)
+		kv.mu.Unlock()
+		return false
+	case ok :=<-ch:
+		kv.mu.Lock()
+		delete(kv.NotifyCh, op.ClientId)
+		kv.mu.Unlock()
+		return ok
+	}
+}
+
+func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
+	// Your code here.
+	// kv.mu.Lock()
+	// // fmt.Println(kv.gid, kv.config)
+	// if !kv.checkShard(args.Key) {
+	// 	reply.Err = ErrWrongGroup
+	// 	kv.mu.Unlock()
+	// 	return
+	// }
+	// kv.mu.Unlock()
+	op := Op{
+		Key:       args.Key,
+		Value:     "",
+		Op:        "Get",
+		ClientId:  args.ClientId,
+		SequenceNumber: args.SequenceNumber,
+	}
+	if kv.waitRaft(op) {
+		kv.mu.Lock()
+		// if !kv.checkShard(args.Key) {
+		// 	reply.Err = ErrWrongGroup
+		// 	kv.mu.Unlock()
+		// 	return
+		// }
+		reply.Value = kv.db[args.Key]
+		// fmt.Println("get: ", args.Key, reply.Value)
+		kv.mu.Unlock()
+		reply.Err = OK
+	} else {
+		kv.mu.Lock()
+		if !kv.checkShard(args.Key) {
+			reply.Err = ErrWrongGroup
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+		kv.mu.Unlock()
+	}
+}
+
+func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	// Your code here.
+	kv.mu.Lock()
+	if !kv.checkShard(args.Key) {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+	op := Op{
+		Key:       args.Key,
+		Value:     args.Value,
+		Op:        args.Op,
+		ClientId:  args.ClientId,
+		SequenceNumber: args.SequenceNumber,
+	}
+	if kv.waitRaft(op) {
+		reply.Err = OK
+		// fmt.Println(args.Op, args.Key, args.Value)
+	} else {
+		kv.mu.Lock()
+		if !kv.checkShard(args.Key) {
+			reply.Err = ErrWrongGroup
+		} else {
+			reply.Err = ErrWrongLeader
+		}
+		kv.mu.Unlock()
+	}
+}
+
+// func (kv *ShardKV) pullShard(shard int, config shardctrler.Config) {
+// 	args := PullShardArgs{
+// 		ConfigNum: kv.config.Num,
+// 	}
+// 	reply := PullShardReply{}
+// 	for i := 0; i < len(config.Groups[config.Shards[shard]]); i++ {
+// 		srv := kv.make_end(config.Groups[config.Shards[shard]][i])
+// 		ok := srv.Call("ShardKV.PullShard", &args, &reply)
+// 		if ok && reply.Err == OK {
+// 			break
+// 		}
+// 	}
+// }
+
+func (kv *ShardKV) GetShard(args *GetShardArgs, reply *GetShardReply) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if args.ConfigNum <= kv.config.Num || kv.config.Shards[args.Shard] != kv.gid {
+		reply.Err = ErrWrongGroup
+	} else if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+	} else {
+		kv.lastLeaders[args.Gid] = args.LeaderId
+		reply.Err = OK
+		kv.configTimer.Reset(0)
+	}
+}
+
+func (kv *ShardKV) PullShard(args *PullShardArgs, reply *PullShardReply) {
+	kv.mu.Lock()
+	if args.ConfigNum <= kv.config.Num {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	} else if args.ConfigNum > kv.config.Num + 1 {
+		reply.Err = ErrNotReady
+		DPrintf("too old")
+		kv.configTimer.Reset(0)
+		kv.mu.Unlock()
+		return
+	} 
+	reply.Err = OK
+	if kv.configState == latest {
+		kv.configTimer.Reset(0)
+	}
+	if kv.configState != waiting {
+		kv.waitCond.Wait()
+	}
+	kv.lastLeaders[args.Gid] = args.LeaderId
+	op := Op{
+		Op: "AddShard",
+		Shard: args.Shard,
+		ConfigNum: args.ConfigNum,
+		Data: args.Data,
+		SessionMap: args.SessionMap,
+	}
+	DPrintf("ConfigNum: %v %v get shard %v from %v data: %v", args.ConfigNum, kv.gid, args.Shard, args.Gid, args.Data)
+	kv.mu.Unlock()
+	ok := kv.waitRaft(op)
+	if ok {
+		reply.Err = OK
+	} else {
+		reply.Err = ErrWrongLeader
+	}
+}
+
+func (kv *ShardKV) apply() {
+	for {
+		select{
+		case msg := <-kv.applyCh:
+			if msg.CommandValid {
+				kv.mu.Lock()
+				if msg.CommandIndex <= kv.lastApplied {
+					kv.mu.Unlock()
+					continue
+				}
+				op := msg.Command.(Op)
+				if (op.Op == "Get" || op.Op == "Append" || op.Op == "Put") {
+					shard := key2shard(op.Key)
+					if kv.sessionMap[shard] == nil {
+						kv.sessionMap[shard] = make(map[int]int)
+					}
+					if kv.sessionMap[shard][op.ClientId] < op.SequenceNumber {
+						if !kv.checkShard(op.Key) {
+							kv.mu.Unlock()
+							continue
+						}
+						// fmt.Println("apply: ", op)
+						DPrintf("msg: %v %v\n", kv.gid, msg)
+						if op.Op == "Put" {
+							kv.db[op.Key] = op.Value
+						} else if op.Op == "Append" {
+							kv.db[op.Key] += op.Value
+						} 
+					}
+
+					kv.sessionMap[shard][op.ClientId] = op.SequenceNumber
+					kv.checkSnapShot(msg.CommandIndex)
+				} else if op.Op == "WaitShard" {
+					if op.Config.Num != kv.config.Num + 1 {
+						DPrintf("wait error")
+					}
+					kv.nextConfig = op.Config
+					kv.configState = waiting
+					kv.waitCond.Broadcast()
+				} else if op.Op == "AddShard" {
+					if op.ConfigNum == kv.config.Num + 1 {
+						if kv.configState != waiting {
+							DPrintf("add error")
+						}
+						DPrintf("before gid %v add shard %v data: %v", kv.gid, op.Shard, kv.db)
+						for key, value := range op.Data {
+							kv.db[key] = value
+						}
+						kv.sessionMap[op.Shard] = make(map[int]int)
+						for k, v := range op.SessionMap{
+							kv.sessionMap[op.Shard][k] = v
+						}
+						DPrintf("after gid %v add shard %v data: %v", kv.gid, op.Shard, op.Data)
+						if _, isLeader := kv.rf.GetState(); isLeader {
+							kv.addCh <- op.Shard
+						}
+					} else{
+						// fmt.Println("add error", op.Config.Num, kv.config.Num)
+					}
+
+				} else if op.Op == "UpdateConfig" {
+					if op.Config.Num == kv.config.Num + 1 {
+						// fmt.Println("update config")
+						// fmt.Println("old config: ", kv.config)
+						DPrintf("gid %v new config: %v", kv.gid, op.Config)
+						kv.config = op.Config
+						if op.Config.Num != kv.nextConfig.Num && kv.configState == waiting {
+							DPrintf("config error")
+						}
+						if kv.configState == waiting {
+							// fmt.Println("config state error")
+						}
+						kv.configState = latest
+					} else{
+						// fmt.Println("update error")
+					}
+				}
+				if ch, ok := kv.NotifyCh[msg.CommandIndex]; ok {
+					select{
+					case ch <- true:
+					default:
+					}
+				}
+
+				kv.lastApplied = msg.CommandIndex
+
+				kv.mu.Unlock()
+
+			} else if msg.SnapshotValid {
+				kv.mu.Lock()
+				if kv.rf.CondInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot){
+					kv.readSnapshot()
+					kv.lastApplied = msg.SnapshotIndex
+				}
+				kv.mu.Unlock()
+			}
+		}
+	}
+}
+
+func (kv *ShardKV) getLatestConfig() {
+	for kv.killed() == false {
+		<-kv.configTimer.C
+		kv.configTimer.Reset(80*time.Millisecond)
+		if _, isLeader := kv.rf.GetState(); !isLeader {
+			continue
+		}
+		// fmt.Println(kv.gid, " get latest config")
+		config := kv.mck.Query(kv.config.Num + 1)
+		// fmt.Println("-----------------", kv.gid, kv.config, config)
+		kv.mu.Lock()
+		if config.Num == kv.config.Num {
+			kv.mu.Unlock()
+			continue
+		}
+		// kv.configState = updating
+		shardAdd := make([]int, 0)
+		shardDelete := make([]int, 0)
+		for i := 0; i < shardctrler.NShards; i++ {
+			if config.Shards[i] == kv.gid && kv.config.Shards[i] != kv.gid && kv.config.Shards[i] != 0{
+				shardAdd = append(shardAdd, i)
+			} else if config.Shards[i] != kv.gid && kv.config.Shards[i] == kv.gid && config.Shards[i] != 0{
+				shardDelete = append(shardDelete, i)
+			}
+		}
+		if len(shardAdd) == 0 && len(shardDelete) == 0 {
+			op := Op{
+				Op: "UpdateConfig",
+				Config: config,
+			}
+			// fmt.Println("no change")
+			kv.mu.Unlock()
+			kv.waitRaft(op)
+			continue
+		}
+		DPrintf("configNum: %v gid %v add %v", kv.config.Num, kv.gid, shardAdd)
+		DPrintf("configNum: %v gid %v delete %v", kv.config.Num, kv.gid, shardDelete)
+		kv.mu.Unlock()
+		// addCount := 0
+		deleteCount := 0
+		for _, shard := range shardAdd {
+			go func(shard int) {
+				gid := kv.config.Shards[shard]
+				if gid == kv.gid {
+					DPrintf("wrong gid")
+				}
+				kv.mu.Lock()
+				lastLeader := kv.lastLeaders[gid]
+				kv.mu.Unlock()
+				servers := kv.config.Groups[gid]
+				for si := 0; si < len(servers); si++ {
+					server := servers[(si + lastLeader) % len(servers)]
+					srv := kv.make_end(server)
+					args := GetShardArgs{
+						Shard: shard,
+						ConfigNum: config.Num,
+						LeaderId: kv.me,
+						Gid: kv.gid,
+					}
+					reply := GetShardReply{}
+					ok := srv.Call("ShardKV.GetShard", &args, &reply)
+					if ok {
+						if reply.Err == OK {
+							return
+						}
+						if reply.Err == ErrWrongGroup {
+							DPrintf("wrong group")
+							return
+						}	
+					}
+				}
+			}(shard)
+		} 
+		go func() {
+			op := Op{
+				Op: "WaitShard",
+				Config: config,
+			}
+			kv.waitRaft(op)
+		}()
+		for _, shard := range shardDelete {
+			go func(shard int) {
+				gid := config.Shards[shard]
+				servers := config.Groups[gid]
+				data := make(map[string]string)
+				kv.mu.Lock()
+				if kv.configState != waiting {
+					kv.waitCond.Wait()
+					if kv.configState != waiting {
+						DPrintf("wait error")
+					}
+				}
+
+				for key, value := range kv.db {
+					if key2shard(key) == shard {
+						data[key] = value
+					}
+				}
+				lastLeader := kv.lastLeaders[gid]
+				kv.mu.Unlock()
+				for{
+					if _, isLeader := kv.rf.GetState(); !isLeader {
+						return
+					}
+					for si := 0; si < len(servers); si++ {
+						server := servers[(si + lastLeader) % len(servers)]
+						srv := kv.make_end(server)
+						args := PullShardArgs{
+							Shard: shard,
+							Data: data,
+							ConfigNum: config.Num,
+							LeaderId: kv.me,
+							Gid: kv.gid,
+							SessionMap: kv.sessionMap[shard],
+						}
+						reply := PullShardReply{}
+						ok := srv.Call("ShardKV.PullShard", &args, &reply)
+						if ok {
+							if reply.Err == OK {
+								kv.deleteCh <- shard
+								return
+							}
+							if reply.Err == ErrWrongGroup {
+								// fmt.Println("wrong group")
+								return
+							}	
+						}
+						DPrintf("pull shard wrong leader")
+					}
+				}
+			}(shard)
+		}
+		for {
+			select{
+				case addShard := <-kv.addCh:
+					for i := 0; i < len(shardAdd); i++ {
+						if shardAdd[i] == addShard {
+							shardAdd = append(shardAdd[:i], shardAdd[i+1:]...)
+							break
+						}
+						if i == len(shardAdd) - 1 {
+							DPrintf("add shard error")
+						}
+					}
+					break
+				case <-kv.deleteCh:
+					deleteCount++
+					break
+				case <-time.After(configtimeout):
+					DPrintf("config timeout")
+			}
+			if _, isLeader := kv.rf.GetState(); !isLeader {
+				break
+			}
+			if 0 == len(shardAdd) && deleteCount == len(shardDelete) {
+				op := Op{
+					Op: "UpdateConfig",
+					Config: config,
+				}
+				kv.waitRaft(op)
+				break
+			}
+		}
+
+	}
+}
+
+func (kv *ShardKV) checkShard(key string) bool {
+	shard := key2shard(key)
+	// fmt.Println("shard: ", kv.gid, kv.config.Shards[shard])
+	if kv.configState == waiting {
+		return kv.nextConfig.Shards[shard] == kv.gid && kv.config.Shards[shard] == kv.gid
+	}
+	return kv.gid == kv.config.Shards[shard]
+}
+
+func (kv *ShardKV) checkSnapShot(index int){
+	if kv.maxraftstate == -1 {
+		return
+	}
+	if kv.persister.RaftStateSize() > kv.maxraftstate {
+		// DPrintf("Server %v do snapshot db: %v", kv.me, kv.db)
+		w := new(bytes.Buffer)
+		e := labgob.NewEncoder(w)
+		e.Encode(kv.db)
+		e.Encode(kv.sessionMap)
+		// e.Encode(kv.config)
+		// e.Encode(kv.configState)
+		// e.Encode(kv.nextConfig)
+		kv.rf.Snapshot(index, w.Bytes())	
+	}
+}
+
+func (kv *ShardKV) readSnapshot(){
+	data := kv.persister.ReadSnapshot()
+	if data == nil || len(data) < 1 {
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	// DPrintf("Server %v before read db: %v\n", kv.me, kv.db)
+	d.Decode(&kv.db)
+	d.Decode(&kv.sessionMap)
+	// DPrintf("Server %v after read db: %v\n", kv.me, kv.db)
+
+}
+
+
+//
+// the tester calls Kill() when a ShardKV instance won't
+// be needed again. you are not required to do anything
+// in Kill(), but it might be convenient to (for example)
+// turn off debug output from this instance.
+//
+func (kv *ShardKV) Kill() {
+	kv.rf.Kill()
+	// Your code here, if desired.
+	atomic.StoreInt32(&kv.dead, 1)
+}
+
+func (kv *ShardKV) killed() bool {
+	z := atomic.LoadInt32(&kv.dead)
+	return z == 1
+}
+
+//
+// servers[] contains the ports of the servers in this group.
+//
+// me is the index of the current server in servers[].
+//
+// the k/v server should store snapshots through the underlying Raft
+// implementation, which should call persister.SaveStateAndSnapshot() to
+// atomically save the Raft state along with the snapshot.
+//
+// the k/v server should snapshot when Raft's saved state exceeds
+// maxraftstate bytes, in order to allow Raft to garbage-collect its
+// log. if maxraftstate is -1, you don't need to snapshot.
+//
+// gid is this group's GID, for interacting with the shardctrler.
+//
+// pass ctrlers[] to shardctrler.MakeClerk() so you can send
+// RPCs to the shardctrler.
+//
+// make_end(servername) turns a server name from a
+// Config.Groups[gid][i] into a labrpc.ClientEnd on which you can
+// send RPCs. You'll need this to send RPCs to other groups.
+//
+// look at client.go for examples of how to use ctrlers[]
+// and make_end() to send RPCs to the group owning a specific shard.
+//
+// StartServer() must return quickly, so it should start goroutines
+// for any long-running work.
+//
+func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
+	// call labgob.Register on structures you want
+	// Go's RPC library to marshall/unmarshall.
+	labgob.Register(Op{})
+
+	kv := new(ShardKV)
+	kv.me = me
+	kv.maxraftstate = maxraftstate
+	kv.make_end = make_end
+	kv.gid = gid
+	kv.ctrlers = ctrlers
+
+	// Your initialization code here.
+
+	// Use something like this to talk to the shardctrler:
+	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
+
+	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.db = make(map[string]string)
+	kv.sessionMap = make(map[int]map[int]int)
+	kv.NotifyCh = make(map[int]chan bool)
+	kv.persister = persister
+	kv.lastApplied = 0
+
+	kv.config = kv.mck.Query(-1)
+	kv.configTimer = time.NewTimer(100*time.Millisecond)
+
+	kv.configState = latest
+	kv.waitCond = sync.NewCond(&kv.mu)
+	kv.addCh = make(chan int)
+	kv.deleteCh = make(chan int)
+	kv.nextConfig = kv.config
+	kv.lastLeaders = make(map[int]int)
+
+
+	kv.readSnapshot()
+	go kv.getLatestConfig()
+	go kv.apply()
+
+	return kv
+}
